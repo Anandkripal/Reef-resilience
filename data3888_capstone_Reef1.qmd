@@ -1,0 +1,1245 @@
+---
+title: "data_capstone"
+format: html
+editor: visual
+---
+
+loading in the original reef data and cleaning for joining
+
+```{r setup, include=FALSE}
+
+#====================================================================================================
+# Loading required packages
+#====================================================================================================
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(sf)
+library(tidyverse)
+# Include and configure conflicted to catch namespace collisions
+library(conflicted)
+# Prefer these common tidyverse functions explicitly
+conflict_prefer("expand",    "tidyr")
+conflict_prefer("filter",    "dplyr")
+conflict_prefer("lag",       "dplyr")
+conflict_prefer("pack",      "tidyr")
+conflict_prefer("unpack",    "tidyr")
+conflict_prefer("intersect", "base")
+conflict_prefer("lmer",      "lmerTest")
+conflict_prefer("explain",   "DALEX")
+conflict_prefer("select",    "dplyr")
+conflict_prefer("box",       "shinydashboard")
+conflicts_prefer(plotly::layout)
+
+
+#====================================================================================================
+# loading and manipulating reef data 
+#====================================================================================================
+
+# Read and preprocess data
+reef <- read.csv("ltmp_hc_sc_a_by_site.csv") %>%
+  mutate(DATE = format(as.Date(SAMPLE_DATE), "%d-%m-%Y"))
+
+# Reshape, calculate total cover, and extract year
+reef_wide <- reef %>%
+  pivot_wider(
+    id_cols = c(REEF_NAME, REEF_ID, LATITUDE, LONGITUDE, DATE),
+    names_from = GROUP_CODE,
+    values_from = COVER,
+    names_glue = "{GROUP_CODE}_cover"
+  ) %>%
+  mutate(
+    cover_total = rowSums(select(., ends_with("_cover")), na.rm = TRUE),
+    year = year(dmy(DATE))
+  )
+
+# Filter dataset to years 2010 - 2020 
+new_reef <- reef_wide %>%
+  filter(year >= 2010, year <= 2019)
+
+# Find REEF_IDs with at least 8 years present (because 1995-2003 = 9 years total)
+reef_ids_8plus_years <- new_reef %>%
+  group_by(REEF_ID) %>%
+  summarise(years_present = n_distinct(year)) %>%
+  filter(years_present >= 5) %>%
+  pull(REEF_ID)
+
+# Filter the reef data for those REEF_IDs
+reef_total <- new_reef %>%
+  filter(REEF_ID %in% reef_ids_8plus_years)
+
+
+# dataset with no duplicate years 
+reef_no_duplicate <- reef_total %>%
+  select(-DATE) %>%  
+  group_by(REEF_ID, LATITUDE, LONGITUDE, year) %>%
+  summarise(
+    Algae_cover = mean(Algae_cover, na.rm = TRUE),
+    `Hard_Coral_cover` = mean(`Hard Coral_cover`, na.rm = TRUE),
+    Other_cover = mean(Other_cover, na.rm = TRUE),
+    `Soft_Coral_cover` = mean(`Soft Coral_cover`, na.rm = TRUE),
+    cover_total = mean(cover_total, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+loading in the netcdf hydrodynamic data
+
+```{r}
+#====================================================================================================
+# Loading required packages
+#====================================================================================================
+
+library(ncdf4)
+library(raster)
+library(tidync)
+library(tidyr)
+library(CFtime)
+
+#====================================================================================================
+# Loading in nc files
+#====================================================================================================
+
+# Set path to folder containing files
+# change the directory accoringly to access your downloaded ereef data (file downloads available in the drive folder)
+nc_folder <- "ncfiles_hydrodynamic"
+
+# Load each file manually
+year_2010 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2010.nc"))
+year_2011 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2011.nc"))
+year_2012 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2012.nc"))
+year_2013 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2013.nc"))
+year_2014 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2014.nc"))
+year_2015 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2015.nc"))
+year_2016 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2016.nc"))
+year_2017 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2017.nc"))
+year_2018 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2018.nc"))
+year_2019 <- nc_open(file.path(nc_folder, "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-2019.nc"))
+
+#====================================================================================================
+# Define a function to extract and process one file
+#====================================================================================================
+
+process_year <- function(nc_obj, year_label) {
+  # Get dimensions
+  lon <- ncvar_get(nc_obj, "longitude")
+  lat <- ncvar_get(nc_obj, "latitude")
+  temp <- ncvar_get(nc_obj, "temp")  
+  salt <- ncvar_get(nc_obj, "salt")
+  suspended_solids <- ncvar_get(nc_obj, "EFI")
+  chlorophyll <- ncvar_get(nc_obj, "Chl_a_sum")
+  oxygen <- ncvar_get(nc_obj, "Oxygen")
+  alkalinity <- ncvar_get(nc_obj, "alk")
+
+  # Get depth index and time
+  k <- 1:dim(temp)[3]
+  time_raw <- ncvar_get(nc_obj, "time")
+  tunits <- ncatt_get(nc_obj, "time", "units")
+  cf_time <- CFtime(tunits$value, calendar = "standard", time_raw)
+  timestamps <- as.Date(as_timestamp(cf_time))
+
+  # Build dataframe and reshape
+  df <- expand.grid(
+    lon = lon,
+    lat = lat,
+    k = k,
+    time = timestamps
+  ) %>%
+    mutate(
+      temp = as.vector(temp),
+      salt = as.vector(salt),
+      suspended_solids = as.vector(suspended_solids),
+      chlorophyll = as.vector(chlorophyll),
+      oxygen = as.vector(oxygen),
+      alkalinity = as.vector(alkalinity),
+      year = year_label
+    ) %>%
+    # Filter and aggregate: keep k = 1, drop missing
+    filter(!is.na(temp) & !is.na(salt) & k == 1) %>%
+    group_by(time, lon, lat, year) %>%
+    summarise(
+      avg_temp = mean(temp, na.rm = TRUE),
+      avg_salt = mean(salt, na.rm = TRUE),
+      avg_suspended_solids = mean(suspended_solids, na.rm = TRUE),
+      avg_chlorophyll = mean(chlorophyll, na.rm = TRUE),
+      avg_oxygen = mean(oxygen, na.rm = TRUE),
+      avg_alkalinity = mean(alkalinity, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  return(df)
+}
+
+#====================================================================================================
+# Run for all years 2010–2019
+#====================================================================================================
+
+# List of files and corresponding year labels
+file_years <- 2010:2019
+file_paths <- file.path(nc_folder, paste0(
+  "EREEFS_AIMS-CSIRO_GBR4_H2p0_B3p1_Cq3b_Dhnd_bgc_annual-annual-", file_years, ".nc"
+))
+
+# Open and process each file
+all_years_data <- lapply(seq_along(file_paths), function(i) {
+  nc <- nc_open(file_paths[i])
+  df <- process_year(nc, file_years[i])
+  nc_close(nc)
+  return(df)
+})
+
+# Combine into one data.frame
+combined_df <- bind_rows(all_years_data)
+
+```
+
+Conducting the spatial join between the two datasets
+
+```{r}
+#====================================================================================================
+# Loading required packages
+#====================================================================================================
+
+library(sf)
+library(dplyr)
+
+#====================================================================================================
+# Conduct spatial join
+#====================================================================================================
+
+# Convert reef_no_duplicate to sf while preserving original coordinates
+reef_sf <- reef_no_duplicate %>%
+  mutate(LATITUDE_ORIG = LATITUDE, LONGITUDE_ORIG = LONGITUDE) %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4326) %>%
+  st_transform(3857)
+
+# Convert combined_df to sf
+combined_sf <- combined_df %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(3857)
+
+# Keep only overlapping years
+years_in_common <- intersect(reef_sf$year, combined_sf$year)
+reef_sf <- reef_sf %>% filter(year %in% years_in_common)
+combined_sf <- combined_sf %>% filter(year %in% years_in_common)
+
+# Split by year
+reef_by_year <- split(reef_sf, reef_sf$year)
+combined_by_year <- split(combined_sf, combined_sf$year)
+
+# Nearest feature join per year
+joined_list <- mapply(function(reef, combined) {
+  idx <- st_nearest_feature(reef, combined)
+  matched <- combined[idx, c("avg_temp", "avg_salt", "avg_suspended_solids", 
+                              "avg_chlorophyll", "avg_oxygen", "avg_alkalinity")]
+  
+  result <- bind_cols(
+    st_drop_geometry(reef),
+    st_drop_geometry(matched)
+  ) %>%
+  rename(LATITUDE = LATITUDE_ORIG, LONGITUDE = LONGITUDE_ORIG)
+
+  return(result)
+}, reef_by_year, combined_by_year, SIMPLIFY = FALSE)
+
+# Combine all years into one dataframe
+reef_joined <- bind_rows(joined_list)
+
+```
+
+```{}
+```
+
+Random Forest Model
+
+```{r}
+library(dplyr)
+library(randomForest)
+library(Metrics)
+
+# assume reef_joined is your joined data.frame with columns:
+# REEF_ID (factor), avg_temp, avg_salt, avg_oxygen,
+# avg_chlorophyll, avg_suspended_solids, avg_alkalinity,
+# Algae_cover, Hard_Coral_cover
+
+# Make sure REEF_ID is a factor
+reef_joined <- reef_joined %>%
+  mutate(REEF_ID = factor(REEF_ID))
+
+# Prepare rf_data
+rf_data <- reef_joined %>%
+  select(REEF_ID,
+         avg_temp, avg_salt, avg_oxygen,
+         avg_chlorophyll, avg_suspended_solids, avg_alkalinity,
+         Algae_cover, Hard_Coral_cover) %>%
+  na.omit()
+
+set.seed(3888)
+# Algae RF (include REEF_ID if you like)
+rf_algae <- randomForest(
+  Algae_cover ~ avg_temp + avg_salt + avg_oxygen +
+                avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data       = rf_data,
+  importance = TRUE,
+  ntree      = 500
+)
+
+# Coral RF
+rf_coral <- randomForest(
+  Hard_Coral_cover ~ avg_temp + avg_salt + avg_oxygen +
+                     avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data       = rf_data,
+  importance = TRUE,
+  ntree      = 500
+)
+
+# Predictions
+rf_data <- rf_data %>%
+  mutate(
+    pred_algae = predict(rf_algae, newdata = .),
+    pred_coral = predict(rf_coral, newdata = .)
+  )
+
+# Evaluation metrics
+rmse_algae   <- rmse(rf_data$Algae_cover, rf_data$pred_algae)
+mae_algae    <- mae (rf_data$Algae_cover, rf_data$pred_algae)
+r2_algae     <- 1 - sum((rf_data$Algae_cover - rf_data$pred_algae)^2) /
+                   sum((rf_data$Algae_cover - mean(rf_data$Algae_cover))^2)
+
+rmse_coral   <- rmse(rf_data$Hard_Coral_cover, rf_data$pred_coral)
+mae_coral    <- mae (rf_data$Hard_Coral_cover, rf_data$pred_coral)
+r2_coral     <- 1 - sum((rf_data$Hard_Coral_cover - rf_data$pred_coral)^2) /
+                   sum((rf_data$Hard_Coral_cover - mean(rf_data$Hard_Coral_cover))^2)
+
+cat("=== Algae RF ===\n")
+cat("RMSE:", round(rmse_algae,2), "  MAE:", round(mae_algae,2),
+    "  Pseudo-R²:", round(r2_algae,3), "\n\n")
+
+cat("=== Coral RF ===\n")
+cat("RMSE:", round(rmse_coral,2), "  MAE:", round(mae_coral,2),
+    "  Pseudo-R²:", round(r2_coral,3), "\n")
+
+
+```
+
+Ranger
+
+```{r}
+# =============================================================================
+# 1) Load libraries
+# =============================================================================
+library(dplyr)
+library(ranger)
+library(Metrics)
+
+# =============================================================================
+# 2) Load your spatially‐joined reef data
+#    (assumes you have already run all preprocessing & joins, and saved
+#     the result as "reef_joined.rds")
+# =============================================================================
+reef_joined <- readRDS("reef_joined.rds")
+
+# =============================================================================
+# 3) Prepare training frame for ranger
+# =============================================================================
+rf_data <- reef_joined %>%
+  # ensure REEF_ID is a factor (so ranger can split on it)
+  mutate(REEF_ID = factor(REEF_ID)) %>%
+  # select only the predictors & responses you need
+  select(
+    REEF_ID,
+    avg_temp, avg_salt, avg_oxygen,
+    avg_chlorophyll, avg_suspended_solids, avg_alkalinity,
+    Algae_cover, Hard_Coral_cover
+  ) %>%
+  na.omit()
+
+# =============================================================================
+# 4) Train “global” RFs that include REEF_ID
+#    (ranger can handle high‐cardinality factors)
+# =============================================================================
+set.seed(3888)
+
+rf_global_algae <- ranger(
+  formula      = Algae_cover ~ REEF_ID
+                 + avg_temp + avg_salt + avg_oxygen
+                 + avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data         = rf_data,
+  num.trees    = 500,
+  importance   = "permutation",           # permutation‐based importance
+  write.forest = TRUE,
+  respect.unordered.factors = "order"     # treat REEF_ID as ordered splits
+)
+
+rf_global_coral <- ranger(
+  formula      = Hard_Coral_cover ~ REEF_ID
+                 + avg_temp + avg_salt + avg_oxygen
+                 + avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data         = rf_data,
+  num.trees    = 500,
+  importance   = "permutation",
+  write.forest = TRUE,
+  respect.unordered.factors = "order"
+)
+
+# =============================================================================
+# 5) In‐sample predictions & evaluation
+# =============================================================================
+# get predictions
+rf_data <- rf_data %>%
+  mutate(
+    pred_algae = predict(rf_global_algae, data = .)$predictions,
+    pred_coral = predict(rf_global_coral, data = .)$predictions
+  )
+
+# compute metrics
+rmse_algae <- rmse(rf_data$Algae_cover,   rf_data$pred_algae)
+mae_algae  <- mae (rf_data$Algae_cover,   rf_data$pred_algae)
+r2_algae   <- 1 - sum((rf_data$Algae_cover   - rf_data$pred_algae)^2) /
+                    sum((rf_data$Algae_cover   - mean(rf_data$Algae_cover))^2)
+
+rmse_coral <- rmse(rf_data$Hard_Coral_cover, rf_data$pred_coral)
+mae_coral  <- mae (rf_data$Hard_Coral_cover, rf_data$pred_coral)
+r2_coral   <- 1 - sum((rf_data$Hard_Coral_cover - rf_data$pred_coral)^2) /
+                    sum((rf_data$Hard_Coral_cover - mean(rf_data$Hard_Coral_cover))^2)
+
+# print performance
+cat("=== Algae Cover Model (ranger) ===\n")
+cat(sprintf("Pseudo-R²: %.3f\nRMSE: %.2f\nMAE: %.2f\n\n",
+            r2_algae, rmse_algae, mae_algae))
+
+cat("=== Hard Coral Cover Model (ranger) ===\n")
+cat(sprintf("Pseudo-R²: %.3f\nRMSE: %.2f\nMAE: %.2f\n\n",
+            r2_coral, rmse_coral, mae_coral))
+
+# =============================================================================
+# 6) Variable importance
+# =============================================================================
+imp_algae <- ranger::importance(rf_global_algae)
+imp_coral <- ranger::importance(rf_global_coral)
+
+cat("Top 5 drivers of Algae_cover:\n")
+print(sort(imp_algae, decreasing = TRUE)[1:5])
+
+cat("\nTop 5 drivers of Hard_Coral_cover:\n")
+print(sort(imp_coral, decreasing = TRUE)[1:5])
+
+saveRDS(reef_joined, "reef_joined.rds")
+saveRDS(rf_algae,     "rf_algae.rds")
+saveRDS(rf_coral,     "rf_coral.rds")
+```
+
+Random forest SHAP values
+
+```{r}
+#====================================================================================================
+# SHAP values for algae RF model 
+#====================================================================================================
+
+# load librariies
+library(dplyr)
+library(fastshap)
+library(ggplot2)
+library(tidyr)
+
+# extract model input features 
+X_shap <- rf_data %>%
+  dplyr::select(avg_temp, avg_salt, avg_oxygen,
+         avg_chlorophyll, avg_suspended_solids, avg_alkalinity) %>%
+  data.matrix()
+# safe prediction function
+pred_fun <- function(model, newdata) {
+  as.numeric(predict(model, newdata = as.data.frame(newdata)))
+}
+
+# computing SHAP values for all data 
+set.seed(42)
+shap_matrix <- fastshap::explain(
+  object = rf_algae,
+  X = X_shap,
+  pred_wrapper = pred_fun,
+  nsim = 100
+)
+
+# calculating average SHAP value per variable 
+shap_avg <- as.data.frame(shap_matrix) %>%
+  summarise(across(everything(), ~ mean(abs(.), na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Mean_SHAP")
+
+# plotting average SHAP values 
+ggplot(shap_avg, aes(x = reorder(Variable, Mean_SHAP), y = Mean_SHAP)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Mean SHAP Value for Algae Cover Random Forest",
+    x = "Environmental Variable",
+    y = "Mean Absolute SHAP Value (Importance)"
+  )
+
+#====================================================================================================
+# SHAP values for algae RF model 
+#====================================================================================================
+# load libraries
+library(dplyr)
+library(fastshap)
+library(ggplot2)
+library(tidyr)
+
+# extract model input features
+X_shap_coral <- rf_data %>%
+  dplyr::select(avg_temp, avg_salt, avg_oxygen,
+         avg_chlorophyll, avg_suspended_solids, avg_alkalinity) %>%
+  data.matrix()
+
+# safe prediction function
+pred_fun_coral <- function(model, newdata) {
+  as.numeric(predict(model, newdata = as.data.frame(newdata)))
+}
+
+# computing SHAP values for all data
+set.seed(42)
+shap_matrix_coral <- fastshap::explain(
+  object = rf_coral,
+  X = X_shap_coral,
+  pred_wrapper = pred_fun_coral,
+  nsim = 100
+)
+
+# calculating average SHAP value per variable
+shap_avg_coral <- as.data.frame(shap_matrix_coral) %>%
+  summarise(across(everything(), ~ mean(abs(.), na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Mean_SHAP")
+
+# plotting average SHAP values
+ggplot(shap_avg_coral, aes(x = reorder(Variable, Mean_SHAP), y = Mean_SHAP)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Mean SHAP Value for Hard Coral Cover Random Forest",
+    x = "Environmental Variable",
+    y = "Mean Absolute SHAP Value (Importance)"
+  )
+
+#====================================================================================================
+# SHAP beeswarm plot for Hard Coral Cover RF model
+#====================================================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(fastshap)
+
+# Convert SHAP matrix to long format
+shap_long_coral <- as.data.frame(shap_matrix_coral) %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "Variable", values_to = "SHAP")
+
+# Bind feature values and standardize within each variable
+X_df_coral <- as.data.frame(X_shap_coral) %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "Variable", values_to = "Feature_Value") %>%
+  group_by(Variable) %>%
+  mutate(Feature_Value_Standardized = scale(Feature_Value)[,1]) %>%
+  ungroup()
+
+# Merge SHAP and standardized feature values
+shap_beeswarm <- left_join(shap_long_coral, X_df_coral, by = c("row_id", "Variable"))
+
+# Plot with standardized color scale
+ggplot(shap_beeswarm, aes(
+  x = SHAP,
+  y = reorder(Variable, SHAP, FUN = function(x) mean(abs(x))),
+  color = Feature_Value_Standardized
+)) +
+  geom_jitter(height = 0.2, alpha = 0.6, size = 1.2) +
+  scale_color_viridis_c(option = "D") +
+  theme_minimal() +
+  labs(
+    title = "SHAP Beeswarm Plot – Hard Coral Cover RF Model",
+    x = "SHAP Value (Impact on Model Output)",
+    y = "Environmental Variable",
+    color = "Feature Value"
+  )
+
+#====================================================================================================
+# SHAP Beeswarm Plot – Algae Cover RF Model
+#====================================================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(fastshap)
+
+# Convert SHAP matrix to long format
+shap_long_coral <- as.data.frame(shap_matrix_coral) %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "Variable", values_to = "SHAP")
+
+# Bind feature values and standardize within each variable
+X_df_coral <- as.data.frame(X_shap_coral) %>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(-row_id, names_to = "Variable", values_to = "Feature_Value") %>%
+  group_by(Variable) %>%
+  mutate(Feature_Value_Standardized = scale(Feature_Value)[,1]) %>%
+  ungroup()
+
+# Merge SHAP and standardized feature values
+shap_beeswarm <- left_join(shap_long_coral, X_df_coral, by = c("row_id", "Variable"))
+
+# Plot with standardized color scale
+ggplot(shap_beeswarm, aes(
+  x = SHAP,
+  y = reorder(Variable, SHAP, FUN = function(x) mean(abs(x))),
+  color = Feature_Value_Standardized
+)) +
+  geom_jitter(height = 0.2, alpha = 0.6, size = 1.2) +
+  scale_color_viridis_c(option = "D") +
+  theme_minimal() +
+  labs(
+    title = "SHAP Beeswarm Plot – Hard Coral Cover RF Model",
+    x = "SHAP Value",
+    y = "Environmental Variable",
+    color = "Feature Importance"
+  )
+
+saveRDS(shap_matrix, "shap_matrix.rds")
+saveRDS(shap_matrix_coral, "shap_matrix_coral.rds")
+
+```
+
+Shiny app
+
+```         
+```
+
+Shiny App for Ranger
+
+```{r}
+# install.packages("waterfalls")
+```
+
+```{r}
+# app.R
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 1) Load libraries
+# ───────────────────────────────────────────────────────────────────────────────
+library(shiny)
+library(shinydashboard)
+library(leaflet)
+library(randomForest)  # for rf_algae & rf_coral
+library(dplyr)
+library(plotly)
+library(RColorBrewer)   # for observed‐data palettes
+library(DT)
+library(waterfalls)
+library(ranger)       # fast C++ RF
+library(Metrics)      
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 2) Load & prepare data
+# ───────────────────────────────────────────────────────────────────────────────
+reef_joined <- readRDS("reef_joined.rds")
+rf_algae    <- readRDS("rf_algae.rds")
+rf_coral    <- readRDS("rf_coral.rds")
+reef_df     <- as.data.frame(reef_joined)
+
+# for prediction tabs:
+reef_joined <- reef_joined %>%
+  mutate(REEF_ID = factor(REEF_ID))
+
+rf_data <- reef_joined %>%
+  select(
+    REEF_ID,
+    avg_temp, avg_salt, avg_oxygen,
+    avg_chlorophyll, avg_suspended_solids, avg_alkalinity,
+    Algae_cover, Hard_Coral_cover
+  ) %>% na.omit()
+
+reefs <- reef_joined %>%
+  distinct(REEF_ID, LATITUDE, LONGITUDE)
+
+# train global RFs (unless you prefer to use the loaded rf_algae & rf_coral)
+set.seed(3888)
+rf_global_algae <- ranger(
+  Algae_cover ~ REEF_ID + avg_temp + avg_salt + avg_oxygen
+              + avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data = rf_data, num.trees = 500,
+  importance = "permutation",
+  respect.unordered.factors = "order", write.forest = TRUE
+)
+rf_global_coral <- ranger(
+  Hard_Coral_cover ~ REEF_ID + avg_temp + avg_salt + avg_oxygen
+                  + avg_chlorophyll + avg_suspended_solids + avg_alkalinity,
+  data = rf_data, num.trees = 500,
+  importance = "permutation",
+  respect.unordered.factors = "order", write.forest = TRUE
+)
+
+# compute training performance
+rf_data <- rf_data %>%
+  mutate(
+    pred_algae_rf = predict(rf_global_algae, data = rf_data)$predictions,
+    pred_coral_rf = predict(rf_global_coral, data = rf_data)$predictions
+  )
+rmse_algae <- rmse(rf_data$Algae_cover, rf_data$pred_algae_rf)
+mae_algae  <- mae(rf_data$Algae_cover, rf_data$pred_algae_rf)
+r2_algae   <- 1 - sum((rf_data$Algae_cover - rf_data$pred_algae_rf)^2) /
+                  sum((rf_data$Algae_cover - mean(rf_data$Algae_cover))^2)
+
+rmse_coral <- rmse(rf_data$Hard_Coral_cover, rf_data$pred_coral_rf)
+mae_coral  <- mae(rf_data$Hard_Coral_cover, rf_data$pred_coral_rf)
+r2_coral   <- 1 - sum((rf_data$Hard_Coral_cover - rf_data$pred_coral_rf)^2) /
+                  sum((rf_data$Hard_Coral_cover - mean(rf_data$Hard_Coral_cover))^2)
+
+# variable importance
+imp_algae <- ranger::importance(rf_global_algae)
+imp_coral <- ranger::importance(rf_global_coral)
+df_imp_algae <- data.frame(Variable = names(imp_algae), Importance = imp_algae) %>% arrange(Importance)
+df_imp_coral <- data.frame(Variable = names(imp_coral), Importance = imp_coral) %>% arrange(Importance)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 3) UI
+# ───────────────────────────────────────────────────────────────────────────────
+ui <- dashboardPage(
+dashboardHeader(
+    title = tagList(
+      icon("tint"),    # water drop for coral/sea
+      icon("leaf"),    # leaf for algae
+      "BenthicBalance"
+    )
+  ),  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Home",     tabName = "Home",        icon = icon("home")),
+      menuItem("Explore",   tabName = "observed",    icon = icon("map")),
+      menuItem("Predictions (Single)", tabName = "exploration", icon = icon("globe")),
+      menuItem("Predictions (All)",   tabName = "all",        icon = icon("th")),
+      menuItem("Interpretation", tabName = "interpretation", icon = icon("chart-line"))
+    )
+  ),
+  dashboardBody(
+    tabItems(
+
+      # — Home —
+      tabItem("Home",
+        fluidRow(
+          box(
+            title = "Welcome to the Reef #1 Shiny App!", width = 12, status = "primary", solidHeader = TRUE,
+            h2("Background"),
+            p("Bleaching is a severe issue being faced by the Great Barrier Reef which can lead to long lasting impacts on the ecosystem such as a phase shift towards different dominant organism coverage. Usually temperature alone is used to predict when and how severe these events will be (Magel et al., 2019), however, other environmental factors could also play a significant role in the analysis of bleaching and subsequent phase shifts."),
+            h2("Model Aim"),
+            p("This model aims to explore coral reef degradation, bleaching and phase shifts of benthic compositions in the Great Barrier Reef through multiple environmental variables to predict the coverage of hard coral and macroalgae. Understanding how these factors impact benthic composition will have immense value for conservation and habitat management and the model allows exploration of how changes in these variables directly impact coverage. This contributes to a novel and practical tool for scientists and managers, as it offers insight into the drivers of benthic changes and supports reef conservation."),
+            h2("Environmental Variables used in the model"),
+            tags$ul(
+              tags$li(strong("Temperature:"), " Is the primary stressor causing coral bleaching and subsequent coral mortality and phase shifts (Magel et al., 2019)."),
+              tags$li(strong("Chlorophyll:"), " Causes eutrophication leading to a decline in hard coral coverage (Bell et al., 2013). Eutrophication causes COTS outbreaks, Coral Skeleton Disease and Bleaching (Bell et al., 2013)."),
+              tags$li(strong("Salinity:"), " Affects coral physiology. Acute changes can cause mortality if salinity drops below 15% for extended periods; chronic shifts simplify reef systems and reduce species diversity (Coles and Jokiel, 1992)."),
+              tags$li(strong("Alkalinity:"), " A determinant factor in coral calcification and growth where higher levels lead to better calcification (D’Olivo et al., 2014)."),
+              tags$li(strong("Suspended Solids:"), " Affects the ability for the coral’s symbiotic algae to photosynthesize (D’Olivo et al., 2014)."),
+              tags$li(strong("Oxygen:"), " Can inhibit important processes for corals like photosynthesis and calcification due to higher oxygen levels requiring corals to invest more energy. Algae are more tolerant to low oxygen (Nelson & Altieri, 2019).")
+            ),
+            h2("Instructions / How to use the app"),
+            p("The following pages are the exploration and predictive tool to use the model:"),
+            tags$ol(
+              tags$li(strong("Explore (Tab 2):"), " Change the year via slider to view historical environmental factors and benthic coverages on the maps."),
+              tags$li(strong("Predictions (Single, Tab 3):"), " Manually adjust environmental factor sliders and select a reef to see model-based cover predictions on the map and in the table."),
+              tags$li(strong("Predictions (All, Tab 4):"), " Adjust sliders to view predictions across all reefs simultaneously; overlay algae and coral layers."),
+              tags$li(strong("Interpretations (Tab 5):"), " View SHAP-based interpretation plots to understand which variables drive predictions for each reef.")
+            )
+          )
+        )
+      ),
+
+      # — Explore (Observed Maps & Trends) —
+      tabItem("observed",
+        fluidRow(
+          box(width = 12, status = "info", solidHeader = TRUE,
+            h3("Explore"),
+            p("This page allows users to explore the environmental variables and benthic coverage along the Great Barrier Reef. For the exploration tool, click and drag the sliders to change the variables, and the map will update automatically.")
+          )
+        ),
+        fluidRow(
+          tabBox(
+            title = div("Observed Explore by Variable", style = "width:100%; text-align:center; font-weight:bold;"),
+            width = 12,
+            tabPanel("Algae Cover",      leafletOutput("map_algae_obs",    height = 500)),
+            tabPanel("Hard Coral Cover", leafletOutput("map_coral_obs",    height = 500)),
+            tabPanel("Temperature",      leafletOutput("map_temp",         height = 500)),
+            tabPanel("Salinity",         leafletOutput("map_salt",         height = 500)),
+            tabPanel("Suspended Solids", leafletOutput("map_suspended",    height = 500)),
+            tabPanel("Oxygen",           leafletOutput("map_oxygen",       height = 500)),
+            tabPanel("Alkalinity",       leafletOutput("map_alkalinity",   height = 500)),
+            tabPanel("Chlorophyll",      leafletOutput("map_chlorophyll",  height = 500))
+          )
+        ),
+        fluidRow(
+          box(
+            title = "Filter by Year", width = 12,
+            sliderInput("year_filter", "Select Year", min = 2010, max = 2019, value = 2010, sep = "", step = 1)
+          )
+        ),
+        fluidRow(
+          tabBox(
+            title = div("Environmental Variable Trends (2010–2019)", style = "width:100%; text-align:center; font-weight:bold;"),
+            width = 12,
+            tabPanel("Temperature",      plotlyOutput("bar_temp")),
+            tabPanel("Salinity",         plotlyOutput("bar_salt")),
+            tabPanel("Suspended Solids", plotlyOutput("bar_suspended")),
+            tabPanel("Oxygen",           plotlyOutput("bar_oxygen")),
+            tabPanel("Alkalinity",       plotlyOutput("bar_alkalinity")),
+            tabPanel("Chlorophyll",      plotlyOutput("bar_chlorophyll"))
+          )
+        )
+      ),
+
+      # — Predictions (Single) (interactive prediction) —
+      tabItem("exploration",
+        fluidRow(
+          box(width = 12, status = "info", solidHeader = TRUE,
+            h3("Predictions (Single Reefs)"),
+            p("This page includes a predictive tool that allows for manual manipulation of all environmental factors. A drop down option also allows users to select individual reefs.")
+          )
+        ),
+        fluidRow(
+          box(
+            width = 3, status = "warning", solidHeader = TRUE,
+            selectInput("reef_id", "Reef ID", choices = reefs$REEF_ID),
+            sliderInput("temp",        "Temperature (°C)",      0, 50, 25),
+            sliderInput("salt",        "Salinity",               0, 50, 25),
+            sliderInput("suspended",   "Susp. Solids (EFI)",    0,100, 50),
+            sliderInput("oxygen",      "Oxygen",                 0, 25, 10),
+            sliderInput("alkalinity",  "Alkalinity",             0,3000,1000),
+            sliderInput("chlorophyll", "Chlorophyll (µg/L)",     0,   2,  0.2, step = 0.01)
+          ),
+          box(
+            width = 9, status = "primary", solidHeader = TRUE,
+            leafletOutput("map", height = 400)
+          )
+        ),
+        fluidRow(
+          box(
+            width = 12, status = "primary", solidHeader = TRUE,
+            DTOutput("tbl")
+          )
+        )
+      ),
+
+      # — Predictions (All) (batch prediction) —
+      tabItem("all",
+        fluidRow(
+          box(width = 12, status = "info", solidHeader = TRUE,
+            h3("Predictions (All Reefs)"),
+            p("This page contains an overview of environmental variables on the entire Great Barrier Reef. These factors can be manipulated using the click and drag tool.")
+          )
+        ),
+        fluidRow(
+          box(
+            width = 3, status = "warning", solidHeader = TRUE,
+            sliderInput("temp_all",        "Temperature (°C)",      0, 50, 25),
+            sliderInput("salt_all",        "Salinity",               0, 50, 25),
+            sliderInput("suspended_all",   "Susp. Solids (EFI)",    0,100, 50),
+            sliderInput("oxygen_all",      "Oxygen",                 0, 25, 10),
+            sliderInput("alkalinity_all",  "Alkalinity",             0,3000,1000),
+            sliderInput("chlorophyll_all", "Chlorophyll (µg/L)",     0,   2,  0.2, step = 0.01)
+          ),
+          box(
+            width = 9, status = "primary", solidHeader = TRUE,
+            leafletOutput("map_all", height = 500)
+          )
+        )
+      ),
+
+      # — Interpretation —
+      tabItem("interpretation",
+        fluidRow(
+          box(width = 12, status = "info", solidHeader = TRUE,
+            h3("Interpretations"),
+            p("This page depicts model outputs of which environmental variables are strongest predictors of benthic composition. The drop-down menu allows for users to choose individual reefs. Figure 2 shows the average of environmental parameters and benthic composition.")
+          )
+        ),
+        fluidRow(
+          column(3,
+            box(
+              width = 12, status = "info", solidHeader = TRUE,
+              selectInput("reef_id_interp", "Choose Reef ID:", choices = NULL, width = "100%"),
+              radioButtons("target_variable_tab", "Select Target Variable:",
+                choices = c("Algae Cover" = "algae", "Hard Coral Cover" = "coral"),
+                selected = "algae"
+              )
+            )
+          ),
+          column(9,
+            uiOutput("dynamic_plots")
+          )
+        )
+      )
+
+    )
+  )
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 4) Server
+# ───────────────────────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+
+  # — Explore tab logic —
+  filtered_reef_df <- reactive({
+    reef_df %>% filter(year == input$year_filter)
+  })
+
+  ## Updated render_variable_map function with legend
+render_variable_map <- function(df, var, label, pal = "Blues",
+                                digits = 2, sci = FALSE) {
+  pal_fn <- colorNumeric(palette = pal, domain = df[[var]], na.color = "#B0B0B0")
+  popup  <- paste0(
+    "Reef ID: ", df$REEF_ID,
+    "<br>Lat: ", round(df$LATITUDE,4),
+    "<br>Lon: ", round(df$LONGITUDE,4),
+    "<br>", label, ": ", round(df[[var]],2)
+  )
+
+  lf <- if (sci) {
+    labelFormat(
+      transform = function(x) formatC(x, format = "e", digits = digits),
+      suffix    = ""
+    )
+  } else {
+    labelFormat(digits = digits)
+  }
+
+  leaflet(df) %>%
+    addTiles() %>%
+    addCircleMarkers(
+      ~LONGITUDE, ~LATITUDE,
+      fillColor   = pal_fn(df[[var]]),
+      fillOpacity = 0.8,
+      color       = NA,
+      radius      = 6,
+      popup       = popup
+    ) %>%
+    addLegend(
+      position  = "bottomright",
+      pal       = pal_fn,
+      values    = df[[var]],
+      title     = label,
+      labFormat = lf,
+      opacity   = 0.8
+    )
+}
+
+
+  output$map_algae_obs   <- renderLeaflet({ render_variable_map(filtered_reef_df(), "Algae_cover",      "Algae Cover",      "YlGn") })
+  output$map_coral_obs   <- renderLeaflet({ render_variable_map(filtered_reef_df(), "Hard_Coral_cover", "Hard Coral Cover","YlOrRd") })
+  output$map_temp        <- renderLeaflet({ render_variable_map(filtered_reef_df(), "avg_temp",         "Temperature (°C)",  "Blues") })
+  output$map_salt        <- renderLeaflet({ render_variable_map(filtered_reef_df(), "avg_salt",         "Salinity",         "Oranges") })
+  output$map_suspended <- renderLeaflet({
+  render_variable_map(
+    df     = filtered_reef_df(),
+    var    = "avg_suspended_solids",
+    label  = "Suspended Solids",
+    pal    = "Greens",
+    digits = 8,    # show 8 decimal places
+    sci    = FALSE # force fixed (non-scientific) notation
+  )
+})
+
+
+
+  output$map_oxygen      <- renderLeaflet({ render_variable_map(filtered_reef_df(), "avg_oxygen",       "Oxygen",           "PuRd") })
+  output$map_alkalinity  <- renderLeaflet({ render_variable_map(filtered_reef_df(), "avg_alkalinity",   "Alkalinity",       "Purples") })
+  output$map_chlorophyll <- renderLeaflet({ render_variable_map(filtered_reef_df(), "avg_chlorophyll",  "Chlorophyll (µg/L)","YlGnBu") })
+
+  yearly_avg <- reef_df %>%
+    filter(year >= 2010, year <= 2019) %>%
+    group_by(year) %>%
+    summarise(
+      avg_temp             = mean(avg_temp, na.rm = TRUE),
+      avg_salt             = mean(avg_salt, na.rm = TRUE),
+      avg_suspended_solids = mean(avg_suspended_solids, na.rm = TRUE),
+      avg_oxygen           = mean(avg_oxygen, na.rm = TRUE),
+      avg_alkalinity       = mean(avg_alkalinity, na.rm = TRUE),
+      avg_chlorophyll      = mean(avg_chlorophyll, na.rm = TRUE)
+    )
+
+  render_bar_chart <- function(var, ylab, y_range = NULL, bar_color = "#1f77b4") {
+    renderPlotly({
+      p <- plot_ly(
+        data = yearly_avg,
+        x = ~year,
+        y = as.formula(paste0("~", var)),
+        type = 'bar',
+        marker = list(color = bar_color)
+      )
+
+      if (is.null(y_range)) {
+        p %>% layout(
+          title = paste("Average", ylab, "by Year"),
+          xaxis = list(title = "Year"),
+          yaxis = list(title = ylab)
+        )
+      } else {
+        p %>% layout(
+          title = paste("Average", ylab, "by Year"),
+          xaxis = list(title = "Year"),
+          yaxis = list(title = ylab, range = y_range, autorange = FALSE)
+        )
+      }
+    })
+  }
+
+output$bar_temp        <- render_bar_chart("avg_temp",        "Temperature (°C)",             c(14.0, 22.0),      bar_color = "#174c7c")
+output$bar_salt        <- render_bar_chart("avg_salt",        "Salinity",                    c(35.0, 35.6),      bar_color = "#cc660b")
+output$bar_suspended   <- render_bar_chart("avg_suspended_solids", "Suspended Solids (EFI)", NULL,              bar_color = "#1c6b1c")
+output$bar_oxygen      <- render_bar_chart("avg_oxygen",      "Oxygen",                      NULL,              bar_color = "#991a1b")
+output$bar_alkalinity  <- render_bar_chart("avg_alkalinity",  "Alkalinity",                 c(2245.0, 2257.0),  bar_color = "#6a4791")
+output$bar_chlorophyll <- render_bar_chart("avg_chlorophyll", "Chlorophyll (µg/L)",         NULL,              bar_color = "#5c372e")
+  
+  #
+  # — Predictions (Single) tab logic —
+  #
+  explore_df <- reactive({
+    req(input$reef_id)
+    filter(reefs, REEF_ID == input$reef_id) %>%
+      mutate(
+        REEF_ID              = factor(REEF_ID, levels = levels(rf_data$REEF_ID)),
+        avg_temp             = input$temp,
+        avg_salt             = input$salt,
+        avg_suspended_solids = input$suspended,
+        avg_oxygen           = input$oxygen,
+        avg_alkalinity       = input$alkalinity,
+        avg_chlorophyll      = input$chlorophyll
+      ) %>%
+      mutate(
+        pred_algae = predict(rf_global_algae, data = .)$predictions,
+        pred_coral = predict(rf_global_coral, data = .)$predictions
+      )
+  })
+
+  output$map <- renderLeaflet({
+    
+    df <- explore_df()
+    leaflet(df) %>% addTiles() %>%
+      addCircleMarkers(~LONGITUDE, ~LATITUDE,
+        color = "blue", radius = 8,
+        popup = ~paste0("Algae: ", round(pred_algae,1), "%")
+      ) %>%
+      addCircleMarkers(~LONGITUDE, ~LATITUDE,
+        color = "red", radius = 8,
+        popup = ~paste0("Coral: ", round(pred_coral,1), "%")
+      )
+  })
+
+  output$tbl <- renderDT({
+    explore_df() %>%
+      select(REEF_ID, pred_algae, pred_coral) %>%
+      rename(`Algae (%)` = pred_algae, `Coral (%)` = pred_coral)
+  }, options = list(dom = 't'))
+
+  #
+  # — Predictions (All) tab logic —
+  #
+  all_df <- reactive({
+    reefs %>%
+      mutate(
+        REEF_ID              = factor(REEF_ID, levels = levels(rf_data$REEF_ID)),
+        avg_temp             = input$temp_all,
+        avg_salt             = input$salt_all,
+        avg_suspended_solids = input$suspended_all,
+        avg_oxygen           = input$oxygen_all,
+        avg_alkalinity       = input$alkalinity_all,
+        avg_chlorophyll      = input$chlorophyll_all
+      ) %>%
+      mutate(
+        pred_algae = predict(rf_global_algae, data = .)$predictions,
+        pred_coral = predict(rf_global_coral, data = .)$predictions
+      )
+  })
+
+output$map_all <- renderLeaflet({
+  df <- all_df()
+
+  bins <- seq(0, 100, by = 10)
+  cols <- colorRampPalette(brewer.pal(9, "YlOrRd"))(10)
+
+  palA <- colorBin(cols, domain = df$pred_algae, bins = bins)
+  palC <- colorBin(cols, domain = df$pred_coral,  bins = bins)
+
+  leaflet(df) %>%
+    addTiles() %>%
+    # --- Algae markers & its legend, grouped as a "base" layer
+    addCircleMarkers(
+      ~LONGITUDE, ~LATITUDE,
+      color       = ~palA(pred_algae),
+      fillOpacity = 0.8, radius = 6,
+      label       = ~paste0("Reef ", REEF_ID, "\nAlgae: ", round(pred_algae, 1), "%"),
+      group       = "Algae"
+    ) %>%
+    addLegend(
+      position = "bottomright",
+      pal      = palA,
+      values   = df$pred_algae,
+      title    = "Algae cover (%)",
+      group    = "Algae"
+    ) %>%
+
+    # --- Coral markers & its legend, grouped as a "base" layer
+    addCircleMarkers(
+      ~LONGITUDE, ~LATITUDE,
+      color       = ~palC(pred_coral),
+      fillOpacity = 0.8, radius = 6,
+      label       = ~paste0("Reef ", REEF_ID, "\nCoral: ", round(pred_coral, 1), "%"),
+      group       = "Coral"
+    ) %>%
+    addLegend(
+      position = "bottomleft",
+      pal      = palC,
+      values   = df$pred_coral,
+      title    = "Coral cover (%)",
+      group    = "Coral"
+    ) %>%
+
+    # --- switch to baseGroups for radio buttons
+    addLayersControl(
+      baseGroups = c("Algae", "Coral"),
+      options    = layersControlOptions(collapsed = FALSE)
+    ) %>%
+
+    # --- optionally hide one on load:
+    hideGroup("Coral")
+})
+
+
+  #
+  # — Interpretation tab logic —
+  # SHAP matrices
+  shap_matrix <- readRDS("shap_matrix.rds")
+  shap_matrix_coral <- readRDS("shap_matrix_coral.rds")
+  
+  # Update dropdown input when app launches
+  observe({
+    updateSelectInput(session, "reef_id_interp", choices = unique(rf_data$REEF_ID))
+  })
+  
+  # Reactive SHAP data extraction based on dropdown input
+  reef_shap_data <- reactive({
+    req(input$reef_id_interp)
+    reef_id <- input$reef_id_interp
+  
+    # Algae SHAP
+    reef_indices <- which(rf_data$REEF_ID == reef_id)
+    shap_vals_algae <- colMeans(shap_matrix[reef_indices, , drop = FALSE])
+    shap_df_algae <- data.frame(
+      label = names(shap_vals_algae),
+      value = shap_vals_algae
+    ) %>% arrange(desc(abs(value)))
+  
+    # Coral SHAP
+    reef_indices_coral <- which(rf_data$REEF_ID == reef_id)
+    shap_vals_coral <- colMeans(shap_matrix_coral[reef_indices_coral, , drop = FALSE])
+    shap_df_coral <- data.frame(
+      label = names(shap_vals_coral),
+      value = shap_vals_coral
+    ) %>% arrange(desc(abs(value)))
+  
+    list(algae = shap_df_algae, coral = shap_df_coral)
+  })
+  
+  # Dynamically render the appropriate SHAP plots
+  output$dynamic_plots <- renderUI({
+    if (input$target_variable_tab == "algae") {
+      tagList(
+        div(style = "margin-bottom:30px;",
+            plotOutput("shap_waterfall_algae", height = 300)
+        ),
+        plotOutput("shap_mean_algae", height = 300)
+      )
+    } else {
+      tagList(
+        div(style = "margin-bottom:30px;",
+            plotOutput("shap_waterfall_coral", height = 300)
+        ),
+        plotOutput("shap_mean_coral", height = 300)
+      )
+    }
+  })
+
+  # Algae SHAP waterfall
+  output$shap_waterfall_algae <- renderPlot({
+    req(input$reef_id_interp)
+    df <- reef_shap_data()$algae
+
+    waterfall(
+      .data            = df,
+      rect_text_labels = round(df$value, 2),
+      calc_total       = FALSE,
+      fill_by_sign     = TRUE,
+      fill_colours     = c("peachpuff", "lavender")  # negative, positive
+    ) +
+      labs(
+        title = paste("How Environmental Factors Shift Algae Cover, Reef ID:", input$reef_id_interp),
+        y     = "SHAP Value (Impact on Prediction)",
+        x     = "Variable"
+      ) +
+      theme_minimal()
+  })
+
+  # Coral SHAP waterfall
+  output$shap_waterfall_coral <- renderPlot({
+    req(input$reef_id_interp)
+    df <- reef_shap_data()$coral
+
+    waterfall(
+      .data            = df,
+      rect_text_labels = round(df$value, 2),
+      calc_total       = FALSE,
+      fill_by_sign     = TRUE,
+      fill_colours     = c("#FFDAB9", "#E6E6FA")  # negative, positive
+    ) +
+      labs(
+        title = paste("How Environmental Factors Shift Hard Coral Cover, Reef ID:", input$reef_id_interp),
+        y     = "SHAP Value (Impact on Prediction)",
+        x     = "Variable"
+      ) +
+      theme_minimal()
+  })
+
+  # Mean SHAP bar for Algae
+  output$shap_mean_algae <- renderPlot({
+    ggplot(shap_avg, aes(x = reorder(Variable, Mean_SHAP), y = Mean_SHAP)) +
+      geom_col(fill = "coral") +
+      coord_flip() +
+      theme_classic() +
+      labs(
+        title = "Overall Importance of Environmental Drivers for Algae Cover",
+        x = "Environmental Variable",
+        y = "Mean Absolute SHAP Value"
+      )
+  })
+
+  # Mean SHAP bar for Coral
+  output$shap_mean_coral <- renderPlot({
+    ggplot(shap_avg_coral, aes(x = reorder(Variable, Mean_SHAP), y = Mean_SHAP)) +
+      geom_col(fill = "#1f78b4") +
+      coord_flip() +
+      theme_classic() +
+      labs(
+        title = "Overall Importance of Environmental Drivers for Hard Coral Cover",
+        x = "Environmental Variable",
+        y = "Mean Absolute SHAP Value"
+      )
+  })
+
+
+
+
+}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 5) Launch the app
+# ───────────────────────────────────────────────────────────────────────────────
+shinyApp(ui, server)
+```
